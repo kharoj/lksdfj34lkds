@@ -1,110 +1,74 @@
-name: Windows Secure Session
+name: Windows Remote Workspace
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-session:
+  remote-workspace:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core Remote Settings
+      - name: Enable Remote Desktop Securely
+        shell: powershell
         run: |
+          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0
 
-          netsh advfirewall firewall delete rule name="WinAdmin-Access"
-          
-          netsh advfirewall firewall add rule name="WinAdmin-Access" `
+          # Enable Network Level Authentication (more secure)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
+
+          # Configure firewall
+          netsh advfirewall firewall add rule name="RemoteWorkspaceAccess" `
             dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
 
-      - name: Create Secure User
+      - name: Create Temporary Admin User
+        shell: powershell
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
-          }
-
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $username = "User$((Get-Random -Minimum 1000 -Maximum 9999))"
+          $password = [System.Web.Security.Membership]::GeneratePassword(16,4)
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser -Name "WinAdmin" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "WinAdmin"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "WinAdmin"
-          
-          echo "SESSION_CREDS=User: WinAdmin | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "WinAdmin")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
 
-      - name: Install Tailscale
+          echo "REMOTE_USER=$username" >> $env:GITHUB_ENV
+          echo "REMOTE_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale (Latest)
+        shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+          Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait
+          Remove-Item ts.msi -Force
 
-      - name: Establish Tailscale Connection
+      - name: Connect to Tailscale
+        shell: powershell
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=workspace-$env:GITHUB_RUN_ID
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify Accessibility
+          Start-Sleep -Seconds 10
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Show Connection Info
+        shell: powershell
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to port 3389 failed"
-              exit 1
-          }
+          Write-Host "======= CONNECTION DETAILS ======="
+          Write-Host "IP Address: $env:TS_IP"
+          Write-Host "Username : $env:REMOTE_USER"
+          Write-Host "Password : $env:REMOTE_PASS"
+          Write-Host "=================================="
 
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection
+      - name: Keep Session Alive (6 Hours)
+        shell: powershell
         run: |
-          Write-Host "`n=== WINDOWS ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: WinAdmin"
-          Write-Host "Password: $(echo $env:SESSION_CREDS)"
-          Write-Host "======================`n"
-          
-          while ($true) {
-              Write-Host "[$(Get-Date)] Session Active - Cancel workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "Session active for 6 hours..."
+          Start-Sleep -Seconds 21600
